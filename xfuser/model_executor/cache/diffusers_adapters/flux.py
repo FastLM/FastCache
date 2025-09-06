@@ -12,7 +12,7 @@ from xfuser.model_executor.cache.diffusers_adapters.registry import TRANSFORMER_
 
 from xfuser.model_executor.cache import utils
 
-def create_cached_transformer_blocks(use_cache, transformer, rel_l1_thresh, return_hidden_states_first, num_steps, motion_threshold=0.1, enable_enhanced_linear_approx=False, significance_level=0.05):
+def create_cached_transformer_blocks(use_cache, transformer, rel_l1_thresh, return_hidden_states_first, num_steps, motion_threshold=0.1, enable_enhanced_linear_approx=False, significance_level=0.05, enable_adacorrection=False, adacorr_gamma=1.0, adacorr_lambda=1.0):
     cached_transformer_class = {
         "Fb": utils.FBCachedTransformerBlocks,
         "Tea": utils.TeaCachedTransformerBlocks,
@@ -34,6 +34,9 @@ def create_cached_transformer_blocks(use_cache, transformer, rel_l1_thresh, retu
             motion_threshold=motion_threshold,
             enable_enhanced_linear_approx=enable_enhanced_linear_approx,
             significance_level=significance_level,
+            enable_adacorrection=enable_adacorrection,
+            adacorr_gamma=adacorr_gamma,
+            adacorr_lambda=adacorr_lambda,
             name=TRANSFORMER_ADAPTER_REGISTRY.get(type(transformer)),
         )
     else:
@@ -58,6 +61,9 @@ def apply_cache_on_transformer(
     motion_threshold=0.1,
     enable_enhanced_linear_approx=False,
     significance_level=0.05,
+    enable_adacorrection=False,
+    adacorr_gamma=1.0,
+    adacorr_lambda=1.0,
 ):
     cached_transformer_blocks = nn.ModuleList([
         create_cached_transformer_blocks(
@@ -68,7 +74,10 @@ def apply_cache_on_transformer(
             num_steps,
             motion_threshold,
             enable_enhanced_linear_approx,
-            significance_level
+            significance_level,
+            enable_adacorrection,
+            adacorr_gamma,
+            adacorr_lambda,
         )
     ])
 
@@ -100,3 +109,4 @@ def apply_cache_on_transformer(
 
     return transformer
 
+# 
