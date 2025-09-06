@@ -269,6 +269,9 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         callbacks: Optional[List[CacheCallback]] = None,
         enable_enhanced_linear_approx=False,  # 新增：是否启用增强的线性近似算法
         significance_level=0.05,  # 新增：统计显著性水平
+        enable_adacorrection: bool = False,  # 新增：是否启用AdaCorrection
+        adacorr_gamma: float = 1.0,          # 新增：灵敏度 γ
+        adacorr_lambda: float = 1.0,         # 新增：空间项权重 λ
     ):
         super().__init__(transformer_blocks,
                        single_transformer_blocks=single_transformer_blocks,
@@ -334,6 +337,11 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
             self.chi2_thresholds = {}  # 缓存卡方分布阈值
             
             print(f"Enhanced Linear Approximation Algorithm enabled with significance_level={significance_level}")
+        
+        # 新增：AdaCorrection 参数
+        self.enable_adacorrection = enable_adacorrection
+        self.adacorr_gamma = adacorr_gamma
+        self.adacorr_lambda = adacorr_lambda
 
     def get_chi2_threshold(self, n, d, alpha):
         """计算卡方分布阈值 χ²_{ND, 1-α}"""
@@ -429,66 +437,99 @@ class FastCachedTransformerBlocks(CachedTransformerBlocks):
         
         return motion_hidden, motion_encoder, static_hidden, static_encoder, motion_mask, static_mask
 
+    def compute_adacorr_offset_score(self, current_hidden: torch.Tensor, prev_hidden: torch.Tensor) -> torch.Tensor:
+        """计算 AdaCorrection 的偏移分数 S_t^l = Δ_temp + λ * Δ_spatial
+        - Δ_temp: 跨时间步的均方变化（按 batch 与 token 平均）
+        - Δ_spatial: 当前时间步在通道维的离散度（按 batch 与 token 平均）
+        返回标量张量
+        """
+        if prev_hidden is None:
+            return torch.tensor(0.0, device=current_hidden.device)
+        # 形状期望: [B, N, D]
+        diff_sq = (current_hidden - prev_hidden) ** 2
+        delta_temp = diff_sq.mean()  # 标量
+        # 通道维方差的平方根后再平均以近似复杂度
+        # 避免数值问题，添加微小项
+        spatial_var = current_hidden.var(dim=-1, unbiased=False)  # [B, N]
+        delta_spatial = (spatial_var.clamp_min(1e-12).sqrt()).mean()  # 标量
+        score = delta_temp + self.adacorr_lambda * delta_spatial
+        return score
+
+    def blend_with_adacorrection(self, cached_hidden: torch.Tensor, fresh_hidden: torch.Tensor, offset_score: torch.Tensor) -> torch.Tensor:
+        """根据 λ_t^l = clip(γ * S_t^l, 0, 1) 对 cached 与 fresh 做插值"""
+        lam = torch.clamp(self.adacorr_gamma * offset_score, 0.0, 1.0)
+        # 广播到 hidden 形状
+        while lam.dim() < fresh_hidden.dim():
+            lam = lam.unsqueeze(0)
+        return (1 - lam) * cached_hidden + lam * fresh_hidden
+
     def enhanced_process_blocks(self, start_idx: int, hidden: torch.Tensor, encoder: torch.Tensor, *args, **kwargs):
         """
-        增强的块处理算法，结合块级和token级线性近似
+        增强的块处理算法，结合块级和token级线性近似，且可选执行 AdaCorrection 纠偏插值
         """
-        if not self.enable_enhanced_linear_approx:
+        if not self.enable_enhanced_linear_approx and not self.enable_adacorrection:
             return self.process_blocks(start_idx, hidden, encoder, *args, **kwargs)
         
         # 获取previous hidden states
         prev_hidden_states = self.cache_context.prev_hidden_states
         
-        # 第一步：token级线性近似
-        result = self.enhanced_token_level_linear_approximation(hidden, prev_hidden_states, encoder)
-        motion_hidden, motion_encoder, static_hidden, static_encoder, motion_mask, static_mask = result
+        # 若启用空间/token级线性近似，先执行
+        if self.enable_enhanced_linear_approx:
+            result = self.enhanced_token_level_linear_approximation(hidden, prev_hidden_states, encoder)
+            motion_hidden, motion_encoder, static_hidden, static_encoder, motion_mask, static_mask = result
+            if motion_mask is None or static_mask is None:
+                # 回退为原始流程（仍可使用 AdaCorrection）
+                motion_hidden, motion_encoder = hidden, encoder
+                static_hidden = static_encoder = None
+        else:
+            motion_hidden, motion_encoder = hidden, encoder
+            static_hidden = static_encoder = None
+            motion_mask = static_mask = None
         
-        # 如果没有有效的mask，使用原始处理方式
-        if motion_mask is None or static_mask is None:
-            return self.process_blocks(start_idx, hidden, encoder, *args, **kwargs)
-        
-        # 第二步：对运动token应用块级线性近似
         current_hidden = motion_hidden
         current_encoder = motion_encoder
         
         for i, block in enumerate(self.transformer_blocks[start_idx:], start=start_idx):
-            # 计算相对变化并决定是否使用块级线性近似
-            if prev_hidden_states is not None:
-                approximated_hidden, used_approx = self.enhanced_block_level_linear_approximation(
-                    current_hidden, prev_hidden_states, i
-                )
-                
-                if used_approx:
-                    # 使用线性近似
-                    current_hidden = approximated_hidden
-                    self.cache_hits += 1
-                    continue
+            # 计算 cached 路径（线性近似）和 fresh 路径（完整块）
+            cached_hidden_i = self.block_projections[i](current_hidden)
+            fresh_hidden_i, fresh_encoder_i = block(current_hidden, current_encoder, *args, **kwargs)
+            fresh_hidden_i, fresh_encoder_i = (fresh_hidden_i, fresh_encoder_i) if self.return_hidden_states_first else (fresh_encoder_i, fresh_hidden_i)
             
-            # 完整执行transformer块
-            current_hidden, current_encoder = block(current_hidden, current_encoder, *args, **kwargs)
-            current_hidden, current_encoder = (current_hidden, current_encoder) if self.return_hidden_states_first else (current_encoder, current_hidden)
+            if self.enable_adacorrection and prev_hidden_states is not None:
+                # 计算偏移分数并进行插值
+                offset_score = self.compute_adacorr_offset_score(current_hidden, prev_hidden_states)
+                blended_hidden = self.blend_with_adacorrection(cached_hidden_i, fresh_hidden_i, offset_score)
+                current_hidden, current_encoder = blended_hidden, fresh_encoder_i
+            else:
+                # 若未启用 AdaCorrection，则依据增强线性近似的判定决定
+                if self.enable_enhanced_linear_approx:
+                    approximated_hidden, used_approx = self.enhanced_block_level_linear_approximation(current_hidden, prev_hidden_states, i)
+                    if used_approx:
+                        current_hidden = approximated_hidden
+                        self.cache_hits += 1
+                        continue
+                # 默认采用 fresh 路径
+                current_hidden, current_encoder = fresh_hidden_i, fresh_encoder_i
         
-        # 处理single_transformer_blocks（如果存在）
+        # 处理 single_transformer_blocks（如果存在）
         if self.single_transformer_blocks and current_encoder is not None:
             current_hidden = torch.cat([current_encoder, current_hidden], dim=1)
             for block in self.single_transformer_blocks:
                 current_hidden = block(current_hidden, *args, **kwargs)
             current_encoder, current_hidden = current_hidden.split([current_encoder.shape[1], current_hidden.shape[1] - current_encoder.shape[1]], dim=1)
         
-        # 第三步：最终组合
-        # 将处理后的运动token和静态token组合
-        final_hidden = hidden.clone()
-        final_hidden[motion_mask] = current_hidden[motion_mask]
-        if static_hidden is not None:
+        # 最终组合运动/静态 token（若有）
+        if motion_mask is not None and static_mask is not None and static_hidden is not None:
+            final_hidden = hidden.clone()
+            final_hidden[motion_mask] = current_hidden[motion_mask]
             final_hidden[static_mask] = static_hidden[static_mask]
-        
-        final_encoder = encoder.clone() if encoder is not None else None
-        if final_encoder is not None and current_encoder is not None:
-            final_encoder[motion_mask] = current_encoder[motion_mask]
-            if static_encoder is not None:
+            final_encoder = encoder.clone() if encoder is not None else None
+            if final_encoder is not None and current_encoder is not None and static_encoder is not None:
+                final_encoder[motion_mask] = current_encoder[motion_mask]
                 final_encoder[static_mask] = static_encoder[static_mask]
+            return final_hidden, final_encoder
         
-        return final_hidden, final_encoder
+        return current_hidden, current_encoder
 
     def get_start_idx(self) -> int:
         return 0  # Process all blocks when not caching
